@@ -18,13 +18,13 @@ static uint32_t (*crc32c_impl)(uint32_t crc, unsigned char const *data, uint32_t
 
 #ifdef __x86_64__
 
-#ifdef __GLIBC__
 
 /* asmlinkage */ unsigned int crc_pcl(const unsigned char *buffer, unsigned int len, unsigned int crc_init);
 static unsigned int crc32c_pcl(uint32_t crc, unsigned char const *data, uint32_t len) {
 	return crc_pcl(data, len, crc);
 }
 
+#ifdef __GLIBC__
 #endif
 
 /*
@@ -94,10 +94,10 @@ void crc32c_init_accel(void)
 	 * now.
 	 */
 	if (0) {
-#ifdef __GLIBC__
 	} else if (cpu_has_feature(CPU_FLAG_PCLMUL)) {
 		/* printf("CRC32C: pcl\n"); */
 		crc32c_impl = crc32c_pcl;
+#ifdef __GLIBC__
 #endif
 	} else if (cpu_has_feature(CPU_FLAG_SSE42)) {
 		/* printf("CRC32c: intel\n"); */

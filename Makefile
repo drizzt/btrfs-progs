@@ -416,9 +416,9 @@ endif
 
 ifeq ($(TARGET_CPU),x86_64)
 # FIXME: linkage is broken on musl for some reason
-ifeq ($(HAVE_GLIBC),1)
 CRYPTO_OBJECTS += crypto/crc32c-pcl-intel-asm_64.o
 ASFLAGS += -fPIC
+ifeq ($(HAVE_GLIBC),1)
 endif
 endif
 
