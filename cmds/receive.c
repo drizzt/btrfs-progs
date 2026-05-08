@@ -45,6 +45,7 @@
 #include <zstd.h>
 #endif
 #include "kernel-shared/uapi/btrfs.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "common/defs.h"
 #include "common/messages.h"
 #include "common/utils.h"
@@ -1342,37 +1343,119 @@ static int process_fallocate(const char *path, int mode, u64 offset, u64 len,
 	return 0;
 }
 
+/*
+ * Per-inode compression algorithm xattr (e.g. "zstd", "lzo", "zlib",
+ * "no"). btrfs_fileattr_set() rewrites this xattr based on
+ * FS_COMPR_FL/FS_NOCOMP_FL on every FS_IOC_SETFLAGS call, so save and
+ * restore around the ioctl to preserve a per-inode algorithm chosen by
+ * an earlier set_xattr command.
+ */
+#define BTRFS_XATTR_COMPRESSION		"btrfs.compression"
+
+/*
+ * The kernel sends raw on-disk btrfs_inode_item flags. Translate the
+ * subset that has user-visible FS_*_FL equivalents (settable via chattr)
+ * so we can hand them to FS_IOC_SETFLAGS. Dropped bits:
+ *  - NODATASUM: implied by NODATACOW, no separate FS_*_FL.
+ *  - READONLY:  internal subvol-RO marker, not a per-inode chattr flag.
+ *  - PREALLOC:  no FS_PREALLOC_FL; set by the kernel automatically when
+ *               fallocate-allocated extents arrive on the receive side.
+ */
+static int btrfs_iflags_to_fs_flags(u64 btrfs_flags)
+{
+	int fs = 0;
+
+	if (btrfs_flags & BTRFS_INODE_NODATACOW)	fs |= FS_NOCOW_FL;
+	if (btrfs_flags & BTRFS_INODE_SYNC)		fs |= FS_SYNC_FL;
+	if (btrfs_flags & BTRFS_INODE_IMMUTABLE)	fs |= FS_IMMUTABLE_FL;
+	if (btrfs_flags & BTRFS_INODE_APPEND)		fs |= FS_APPEND_FL;
+	if (btrfs_flags & BTRFS_INODE_NODUMP)		fs |= FS_NODUMP_FL;
+	if (btrfs_flags & BTRFS_INODE_NOATIME)		fs |= FS_NOATIME_FL;
+	if (btrfs_flags & BTRFS_INODE_DIRSYNC)		fs |= FS_DIRSYNC_FL;
+	if (btrfs_flags & BTRFS_INODE_COMPRESS)		fs |= FS_COMPR_FL;
+	if (btrfs_flags & BTRFS_INODE_NOCOMPRESS)	fs |= FS_NOCOMP_FL;
+	return fs;
+}
+
+/*
+ * FS_IOC_SETFLAGS replaces (not ORs) the inode's user-visible flag set with
+ * the value passed in. Safe here because the destination subvol is freshly
+ * created by this receive operation, so there are no pre-existing flags to
+ * clobber. Don't reuse this handler in any context where the destination
+ * may carry flags set by the local sysadmin.
+ *
+ * btrfs_fileattr_set() in the kernel resets btrfs.compression whenever
+ * FS_IOC_SETFLAGS is called: with FS_COMPR_FL the xattr is rewritten to
+ * the FS default (mount option or zlib), with FS_NOCOMP_FL or no
+ * compression flag at all the xattr is removed. A set_xattr command for
+ * btrfs.compression earlier in the stream may have stored a specific
+ * algorithm (zstd, lzo, ...); preserve it across the ioctl by saving
+ * and restoring the value when FS_COMPR_FL is in the flag set.
+ */
 static int process_fileattr(const char *path, u64 attr, void *user)
 {
-#if 0
-	/*
-	 * Not yet supported, ignored for now, just like in send stream v1.
-	 * The content of 'attr' matches the flags in the btrfs inode item,
-	 * we can't apply them directly with FS_IOC_SETFLAGS, as we need to
-	 * convert them from BTRFS_INODE_* flags to FS_* flags. Plus some
-	 * flags are special and must be applied in a special way.
-	 * The commented code below therefore does not work.
-	 */
-
 	int ret;
+	int fd;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	int fs_flags = btrfs_iflags_to_fs_flags(attr);
+	/*
+	 * Algorithm names today fit in tens of bytes ("zstd:15", "zlib:9",
+	 * "lzo", "none"); 256 is generous headroom against future
+	 * "<algo>:<level>" extensions without risking ERANGE silently
+	 * dropping the saved value.
+	 */
+	char comp_val[256];
+	ssize_t comp_len = -1;
+
+	/*
+	 * fs_flags == 0 with attr != 0 means the source carries only
+	 * btrfs-internal flags we don't translate (PREALLOC etc.). Leave
+	 * the destination's flags alone in that case. fs_flags == 0 with
+	 * attr == 0 is a legitimate "clear all flags" command emitted by
+	 * the kernel when a chattr -X cleared the last user-visible flag
+	 * on the source - fall through and apply it via FS_IOC_SETFLAGS.
+	 */
+	if (attr != 0 && fs_flags == 0)
+		return 0;
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
 		error("fileattr: path invalid: %s", path);
 		return ret;
 	}
-	ret = open_inode_for_write(rctx, full_path);
-	if (ret < 0)
+	/*
+	 * O_NOFOLLOW refuses a final-component symlink. O_NONBLOCK avoids
+	 * blocking forever if the destination happens to be a FIFO or a
+	 * named socket (the kernel should never emit fileattr for those,
+	 * but a malicious or corrupted stream could). FS_IOC_SETFLAGS does
+	 * not require write access; the ioctl perm check is owner_or_capable.
+	 */
+	fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	if (fd < 0) {
+		ret = -errno;
+		error("fileattr: cannot open %s: %m", full_path);
 		return ret;
-	ret = ioctl(rctx->write_fd, FS_IOC_SETFLAGS, &attr);
+	}
+	if (fs_flags & FS_COMPR_FL) {
+		comp_len = fgetxattr(fd, BTRFS_XATTR_COMPRESSION, comp_val,
+				     sizeof(comp_val));
+		if (comp_len < 0 && errno != ENODATA)
+			warning("fileattr: cannot read %s on %s: %m",
+				BTRFS_XATTR_COMPRESSION, path);
+	}
+	ret = ioctl(fd, FS_IOC_SETFLAGS, &fs_flags);
 	if (ret < 0) {
 		ret = -errno;
 		error("fileattr: set file attributes on %s failed: %m", path);
+		close(fd);
 		return ret;
 	}
-#endif
+	if (comp_len > 0 &&
+	    fsetxattr(fd, BTRFS_XATTR_COMPRESSION, comp_val, comp_len, 0) < 0)
+		warning("fileattr: cannot restore %s on %s: %m",
+			BTRFS_XATTR_COMPRESSION, path);
+	close(fd);
 	return 0;
 }
 
